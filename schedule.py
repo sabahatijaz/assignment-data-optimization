@@ -1,22 +1,34 @@
-from pyomo.environ import ConcreteModel, Var, Objective, Constraint, NonNegativeReals, SolverFactory
+import pandas as pd
+from pyomo.environ import ConcreteModel, Var, Objective, Constraint, NonNegativeReals, SolverFactory, minimize
 from pyomo.opt import SolverStatus, TerminationCondition
 from fastapi import HTTPException
 
-def solve_battery_schedule(params, top_up):
+def solve_battery_schedule(prices_df: pd.DataFrame,
+    soc_start: float,
+    soc_max: float,
+    soc_min: float,
+    soc_target: float,
+    power_capacity: float,
+    conversion_efficiency: float = 1.0,top_up=False,storage_capacity=100,penalty_per_unit=1):
     model = ConcreteModel()
 
     # Number of time steps
-    T = 6
+    T = len(prices_df)
     model.T = range(T)
 
     # Parameters
-    model.soc_start = params.soc_start
-    model.soc_min = params.soc_min
-    model.soc_max = params.soc_max
-    model.soc_target = params.soc_target
-    model.power_capacity = params.power_capacity
-    model.conversion_efficiency = params.conversion_efficiency
-    model.storage_capacity = params.storage_capacity
+    model.soc_start = soc_start
+    model.soc_min = soc_min
+    model.soc_max = soc_max
+    model.soc_target = soc_target
+    model.power_capacity = power_capacity
+    model.conversion_efficiency = conversion_efficiency
+    model.storage_capacity = storage_capacity
+    model.penalty_per_unit = penalty_per_unit
+    
+    # Prices
+    model.price_consumption= [prices_df['consumption'][t] for t in model.T]
+    model.price_production = [prices_df['production'][t] for t in model.T]
 
     # Variables
     model.charge = Var(model.T, domain=NonNegativeReals)
@@ -24,12 +36,18 @@ def solve_battery_schedule(params, top_up):
     model.soc = Var(model.T, domain=NonNegativeReals)
 
     # Objective
-    def objective_rule(model):
-        return sum(
-            (0.1 * model.charge[t] - 0.1 * model.discharge[t])
+    def cost_function(model):
+        cost = sum(
+            (model.price_consumption[t] * model.charge[t] - model.price_production[t] * model.discharge[t])
             for t in model.T
         )
-    model.obj = Objective(rule=objective_rule)
+        penalty = sum(
+            model.penalty_per_unit * (model.soc[t] - model.soc_max)
+            for t in model.T if model.soc[t] > model.soc_max
+        )
+        return cost + penalty
+    
+    model.costs = Objective(rule=cost_function, sense=minimize)
 
     # Constraints
     def soc_constraint_rule(model, t):
@@ -63,16 +81,25 @@ def solve_battery_schedule(params, top_up):
         model.soc_soft_constraint = Constraint(model.T, rule=soc_soft_constraint_rule)
 
     # Solve the model
-    solver = SolverFactory('glpk')
-    results = solver.solve(model)
+    solver = SolverFactory('appsi_highs')
+    try:
+        results = solver.solve(model, tee=True)
+        if results.solver.status != SolverStatus.ok:
+            raise HTTPException(status_code=400, detail="Solver did not return an OK status.")
+        if results.solver.termination_condition != TerminationCondition.optimal:
+            raise HTTPException(status_code=400, detail="Solver did not find an optimal solution.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while solving the model: {str(e)}")
 
-    if results.solver.status != SolverStatus.ok or results.solver.termination_condition != TerminationCondition.optimal:
-        raise HTTPException(status_code=400, detail="Infeasible problem or no solution found")
+    # Extract and return results
+    try:
+        schedule = {
+            "total_cost": model.costs(),
+            "charge_schedule": [model.charge[t].value for t in model.T],
+            "discharge_schedule": [model.discharge[t].value for t in model.T],
+            "soc_schedule": [model.soc[t].value for t in model.T]
+        }
+    except AttributeError as e:
+        raise HTTPException(status_code=500, detail=f"Error extracting results: {str(e)}")
 
-    schedule = {
-        "total_cost": model.obj(),
-        "charge_schedule": [model.charge[t].value for t in model.T],
-        "discharge_schedule": [model.discharge[t].value for t in model.T],
-        "soc_schedule": [model.soc[t].value for t in model.T]
-    }
     return schedule
